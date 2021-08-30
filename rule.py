@@ -16,11 +16,11 @@ Scenarios:
      Then: Return Empty list
   Scenario: 2
     Given: At least one AWS DMS Replication Instance exists
-      And:  Attached Security Group has at least one ingress rule
-      Then: Return NON_COMPLIANT with annotation "This AWS DMS Replication Instance has ingress enabled"
+      And:  Attached Security Group has egress rule using protocol other than TCP on port other than apppoved port list [ 5401 (PostGreSQL) / 1521/2484 (Oracle) / MSSQL(1401) ]
+      Then: Return NON_COMPLIANT with annotation "This AWS DMS Replication Instance has egress enabled on unapproved port"
   Scenario: 3
     Given: At least one AWS DMS Replication Instance exists
-      And: Attached Security Group has no ingress rule
+      And: Attached Security Group has egress rule using TCP protocol on apppoved port list [ 5401 (PostGreSQL) / 1521/2484 (Oracle) / MSSQL(1401) ]
      Then: Return COMPLIANT
 
 """
@@ -30,6 +30,8 @@ import sys
 import datetime
 import boto3
 import botocore
+import ipaddress
+
 
 try:
     import liblogging
@@ -42,6 +44,11 @@ except ImportError:
 
 # Define the default resource to report to Config Rules
 DEFAULT_RESOURCE_TYPE = 'AWS::DMS::ReplicationInstance'
+
+APPROVED_PORT_LIST = [5401,1521,2484,1401]
+APPROVED_IP_NW_1 = ipaddress.ip_network('10.0.0.0/8')
+APPROVED_IP_NW_2 = ipaddress.ip_network('172.16.0.0/12')
+
 
 # Set to True to get the lambda to assume the Role attached on the Config Service (useful for cross-account).
 ASSUME_ROLE_MODE = False
@@ -58,7 +65,7 @@ def evaluate_compliance(event, configuration_item, valid_rule_parameters):
     security_group_client = get_client('ec2', event)
     dms_instances = client.describe_replication_instances()['ReplicationInstances']
     evaluations = []
-
+    sg_compliance = []
     #SCENARIO 1 
     if not dms_instances:
         return None
@@ -71,14 +78,24 @@ def evaluate_compliance(event, configuration_item, valid_rule_parameters):
 
         sg_description= security_group_client.describe_security_groups(GroupIds=attached_security_group_ids)
         
-        sg_in_rules = [ sub['IpPermissions'] for sub in  sg_description['SecurityGroups'] ]
-        sg_in_rules = list(filter(None, sg_in_rules))
-        print(sg_in_rules)
-        if sg_in_rules:
+        for sg in  sg_description['SecurityGroups']:
+            for sg_rule in sg['IpPermissionsEgress']:
+                if sg_rule['IpProtocol']=='tcp' and sg_rule['FromPort'] in APPROVED_PORT_LIST and sg_rule['ToPort'] in APPROVED_PORT_LIST:
+                    sg_compliance.append(True)
+                    for ip in sg_rule['IpRanges']:
+                        if ipaddress.ip_network(ip['CidrIp']).subnet_of(APPROVED_IP_NW_1) == True or ipaddress.ip_network(ip['CidrIp']).subnet_of(APPROVED_IP_NW_2) == True:
+                            sg_compliance.append(True)
+                        else:
+                            sg_compliance.append(False)
+                else:
+                    sg_compliance.append(False)
+
+
+        if False in sg_compliance:
         #SCENARIO 2
-            evaluations.append(build_evaluation(dms_instance_details['ReplicationInstanceIdentifier'], 'NON_COMPLIANT', event, annotation='This AWS DMS Replication Instance has ingress enabled'))
+            evaluations.append(build_evaluation(dms_instance_details['ReplicationInstanceIdentifier'], 'NON_COMPLIANT', event, annotation='This AWS DMS Replication Instance has egress enabled on unapproved port/protocol'))
         else:
-            #SCENARIO 3
+        #SCENARIO 3
             evaluations.append(build_evaluation(dms_instance_details['ReplicationInstanceIdentifier'], 'COMPLIANT', event))
 
     return evaluations
@@ -294,6 +311,7 @@ def clean_up_old_evaluations(latest_evaluations, event):
     return cleaned_evaluations + latest_evaluations
 
 def lambda_handler(event, context):
+    
     if 'liblogging' in sys.modules:
         liblogging.logEvent(event)
 
